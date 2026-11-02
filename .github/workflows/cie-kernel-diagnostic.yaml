@@ -1,0 +1,137 @@
+name: CIE kernel baseline comparison
+'on':
+  push:
+    branches:
+    - ci/cie-kernel-diagnostic-ca71
+permissions:
+  contents: read
+jobs:
+  kernel-comparison:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - label: base
+          source: 0251c7094da98516b8ff43219943631afeae6d46
+        - label: head
+          source: ca71b6053689b8eb62d93c3edc1dbea53eb73c67
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      ROS_DISTRO: humble
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
+      MAKEFLAGS: -j4
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ matrix.source }}
+        fetch-depth: 1
+        persist-credentials: false
+    - name: Install ROS and build dependencies
+      shell: bash
+      run: 'set -eo pipefail
+
+        mkdir -p validation-logs
+
+        git rev-parse HEAD | tee validation-logs/tested-sha.txt
+
+        uname -a | tee validation-logs/kernel.txt
+
+        sudo apt-get update
+
+        sudo apt-get install -y --no-install-recommends curl ca-certificates gnupg locales build-essential cmake git pkg-config
+        libgoogle-glog-dev liblttng-ust-dev libunwind-dev libcap2-bin linux-headers-$(uname -r)
+
+        sudo locale-gen en_US.UTF-8
+
+        sudo curl -fsSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key -o /usr/share/keyrings/ros-archive-keyring.gpg
+
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu
+        $(. /etc/os-release && echo "$UBUNTU_CODENAME") main" | sudo tee /etc/apt/sources.list.d/ros2.list
+
+        sudo apt-get update
+
+        sudo apt-get install -y --no-install-recommends ros-${ROS_DISTRO}-ros-base python3-rosdep python3-colcon-common-extensions
+        python3-pytest
+
+        source /opt/ros/${ROS_DISTRO}/setup.bash
+
+        if [ ! -f /etc/ros/rosdep/sources.list.d/20-default.list ]; then sudo rosdep init; fi
+
+        rosdep update --rosdistro ${ROS_DISTRO}
+
+        rosdep install -y --from-paths src --ignore-src --rosdistro ${ROS_DISTRO}
+
+        if ! command -v rustup >/dev/null; then curl --proto ''=https'' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y
+        --profile minimal --default-toolchain 1.75.0; fi
+
+        source "$HOME/.cargo/env"
+
+        rustup toolchain install 1.75.0 --profile minimal
+
+        '
+    - name: Build complete workspace and heaphook
+      id: build
+      shell: bash
+      run: 'set -eo pipefail
+
+        source /opt/ros/${ROS_DISTRO}/setup.bash
+
+        source "$HOME/.cargo/env"
+
+        colcon build --symlink-install --executor sequential --cmake-args -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
+        2>&1 | tee validation-logs/build.log
+
+        cargo +1.75.0 build --manifest-path agnocast_heaphook/Cargo.toml --release 2>&1 | tee validation-logs/heaphook.log
+
+        cp agnocast_heaphook/target/release/libagnocast_heaphook.so install/agnocastlib/lib/
+
+        '
+    - name: Build and load matching kernel module
+      id: module
+      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+      shell: bash
+      run: 'set -eo pipefail
+
+        make -C agnocast_kmod PWD="$PWD/agnocast_kmod" 2>&1 | tee validation-logs/kmod-build.log
+
+        sudo insmod agnocast_kmod/agnocast.ko
+
+        grep ''^agnocast '' /proc/modules | tee validation-logs/module-loaded.txt
+
+        test -c /dev/agnocast
+
+        sudo chmod a+rw /dev/agnocast
+
+        '
+    - name: Run kernel-module integration tests
+      id: kernel
+      if: ${{ !cancelled() && steps.module.outcome == 'success' }}
+      shell: bash
+      run: 'set -eo pipefail
+
+        source /opt/ros/${ROS_DISTRO}/setup.bash
+
+        source install/setup.bash
+
+        bash scripts/test/run_requires_kernel_module_tests.bash 2>&1 | tee validation-logs/kernel-tests.log
+
+        '
+    - name: Collect diagnostics
+      if: always()
+      shell: bash
+      run: "mkdir -p validation-logs\nsudo dmesg > validation-logs/dmesg.log || true\ncp -r /tmp/e2e_1to1_logs validation-logs/\
+        \ 2>/dev/null || true\nif [ -f install/setup.bash ]; then\n  source /opt/ros/${ROS_DISTRO}/setup.bash\n  source install/setup.bash\n\
+        \  colcon test-result --verbose > validation-logs/test-results.log 2>&1 || true\nfi\n"
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: cie-kernel-diagnostic-${{ matrix.label }}
+        path: 'validation-logs/
+
+          build/*/test_results/
+
+          log/
+
+          '
+        retention-days: 14

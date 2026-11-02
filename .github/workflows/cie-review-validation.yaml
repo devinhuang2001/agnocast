@@ -76,7 +76,7 @@ jobs:
         shell: bash
         run: |
           set -eo pipefail
-          make -C agnocast_kmod 2>&1 | tee validation-logs/kmod-build.log
+          make -C agnocast_kmod PWD="$PWD/agnocast_kmod" 2>&1 | tee validation-logs/kmod-build.log
           sudo insmod agnocast_kmod/agnocast.ko
           grep '^agnocast ' /proc/modules | tee validation-logs/module-loaded.txt
           test -c /dev/agnocast
@@ -100,8 +100,7 @@ jobs:
           set -eo pipefail
           source /opt/ros/${ROS_DISTRO}/setup.bash
           source install/setup.bash
-          export LD_PRELOAD="$PWD/install/agnocastlib/lib/libagnocast_heaphook.so"
-          launch_test src/agnocast_e2e_test/test/functional/test_agnocast_callback_isolated_executor_launch.py 2>&1 | tee validation-logs/cie-launch.log
+          LD_PRELOAD="$PWD/install/agnocastlib/lib/libagnocast_heaphook.so:$PWD/install/agnocastlib/lib/libagnocast.so" launch_test src/agnocast_e2e_test/test/functional/test_agnocast_callback_isolated_executor_launch.py 2>&1 | tee validation-logs/cie-launch.log
       - name: Run all 1-to-1 E2E combinations
         id: one
         if: ${{ !cancelled() && steps.module.outcome == 'success' }}

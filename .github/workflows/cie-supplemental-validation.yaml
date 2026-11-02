@@ -1,0 +1,185 @@
+name: CIE complete launch and heaphook validation
+permissions:
+  contents: read
+jobs:
+  ros-validation:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - os: ubuntu-24.04
+          ros: jazzy
+        - os: ubuntu-22.04
+          ros: humble
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      ROS_DISTRO: ${{ matrix.ros }}
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
+      MAKEFLAGS: -j4
+      COLCON_DEFAULTS_FILE: /tmp/cie-colcon-defaults.yaml
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: 6fddbe5481910d047d8eef8f2be4928c0a9cd97c
+        fetch-depth: 1
+        persist-credentials: false
+    - name: Install ROS and build dependencies
+      shell: bash
+      run: 'set -eo pipefail
+
+        mkdir -p validation-logs
+
+        printf ''build:\n  executor: sequential\n'' > "$COLCON_DEFAULTS_FILE"
+
+        git rev-parse HEAD | tee validation-logs/tested-sha.txt
+
+        uname -a | tee validation-logs/kernel.txt
+
+        sudo apt-get update
+
+        sudo apt-get install -y --no-install-recommends curl ca-certificates gnupg locales build-essential cmake
+        git pkg-config libgoogle-glog-dev liblttng-ust-dev libunwind-dev libcap2-bin linux-headers-$(uname -r)
+
+        sudo locale-gen en_US.UTF-8
+
+        sudo curl -fsSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key -o /usr/share/keyrings/ros-archive-keyring.gpg
+
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu
+        $(. /etc/os-release && echo "$UBUNTU_CODENAME") main" | sudo tee /etc/apt/sources.list.d/ros2.list
+
+        sudo apt-get update
+
+        sudo apt-get install -y --no-install-recommends ros-${ROS_DISTRO}-ros-base python3-rosdep python3-colcon-common-extensions
+        python3-pytest
+
+        source /opt/ros/${ROS_DISTRO}/setup.bash
+
+        if [ ! -f /etc/ros/rosdep/sources.list.d/20-default.list ]; then sudo rosdep init; fi
+
+        rosdep update --rosdistro ${ROS_DISTRO}
+
+        rosdep install -y --from-paths src --ignore-src --rosdistro ${ROS_DISTRO}
+
+        if ! command -v rustup >/dev/null; then curl --proto ''=https'' --tlsv1.2 -fsSL https://sh.rustup.rs | sh
+        -s -- -y --profile minimal --default-toolchain 1.75.0; fi
+
+        source "$HOME/.cargo/env"
+
+        rustup toolchain install 1.75.0 --profile minimal
+
+        '
+    - name: Build complete workspace and heaphook
+      id: build
+      shell: bash
+      run: 'set -eo pipefail
+
+        source /opt/ros/${ROS_DISTRO}/setup.bash
+
+        source "$HOME/.cargo/env"
+
+        colcon build --symlink-install --executor sequential --cmake-args -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
+        2>&1 | tee validation-logs/build.log
+
+        cargo +1.75.0 build --manifest-path agnocast_heaphook/Cargo.toml --release 2>&1 | tee validation-logs/heaphook.log
+
+        cp agnocast_heaphook/target/release/libagnocast_heaphook.so install/agnocastlib/lib/
+
+        '
+    - name: Run independent heaphook integration test
+      id: heap
+      shell: bash
+      run: 'set -eo pipefail
+
+        source /opt/ros/${ROS_DISTRO}/setup.bash
+
+        source install/setup.bash
+
+        colcon test --packages-select agnocastlib --event-handlers console_direct+ --return-code-on-test-failure
+        --ctest-args -R ''^test_integration_agnocast_heaphook$'' 2>&1 | tee validation-logs/heaphook-tests.log
+
+        '
+    - name: Build and load matching kernel module
+      id: module
+      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+      shell: bash
+      run: 'set -eo pipefail
+
+        make -C agnocast_kmod PWD="$PWD/agnocast_kmod" 2>&1 | tee validation-logs/kmod-build.log
+
+        sudo dmesg -C
+
+        sudo insmod agnocast_kmod/agnocast.ko
+
+        grep ''^agnocast '' /proc/modules | tee validation-logs/module-loaded.txt
+
+        test -c /dev/agnocast
+
+        sudo chmod a+rw /dev/agnocast
+
+        '
+    - name: Run every CIE and thread configurator launch test
+      id: launch
+      if: ${{ !cancelled() && steps.module.outcome == 'success' }}
+      shell: bash
+      run: 'set -eo pipefail
+
+        source /opt/ros/${ROS_DISTRO}/setup.bash
+
+        source install/setup.bash
+
+        LD_PRELOAD="$PWD/install/agnocastlib/lib/libagnocast_heaphook.so:$PWD/install/agnocastlib/lib/libagnocast.so"
+        colcon test --packages-select agnocast_e2e_test --event-handlers console_direct+ --return-code-on-test-failure
+        --ctest-args -V 2>&1 | tee validation-logs/all-launch-tests.log
+
+        '
+    - name: Unload module after all tests
+      id: unload
+      if: ${{ !cancelled() && steps.module.outcome == 'success' }}
+      shell: bash
+      run: "set -eo pipefail\nfor attempt in $(seq 10); do\n  if sudo rmmod agnocast; then\n    echo 'PASS: module\
+        \ unloaded after all tests' | tee validation-logs/unload.log\n    exit 0\n  fi\n  sleep 1\ndone\nsudo fuser\
+        \ -v /dev/agnocast || true\nexit 1\n"
+    - name: Check kernel warnings after module tests
+      id: kernel_warnings
+      if: ${{ always() && steps.module.outcome == 'success' }}
+      shell: bash
+      run: "set -eo pipefail\nsudo dmesg > validation-logs/dmesg.log\nif grep -nE 'BUG:|WARNING:|Oops|Call Trace:'\
+        \ validation-logs/dmesg.log; then\n  echo 'Kernel warnings observed after loading agnocast'\n  exit 1\n\
+        fi\n"
+    - name: Collect diagnostics
+      if: always()
+      shell: bash
+      run: "mkdir -p validation-logs\nsudo dmesg > validation-logs/dmesg.log || true\ncp -r /tmp/e2e_1to1_logs validation-logs/\
+        \ 2>/dev/null || true\nif [ -f install/setup.bash ]; then\n  source /opt/ros/${ROS_DISTRO}/setup.bash\n\
+        \  source install/setup.bash\n  colcon test-result --verbose > validation-logs/test-results.log 2>&1 ||\
+        \ true\nfi\n"
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: cie-supplemental-validation-${{ matrix.ros }}
+        path: 'validation-logs/
+
+          build/*/test_results/
+
+          log/
+
+          '
+        retention-days: 14
+    - name: Require all supplemental tests to pass
+      if: always()
+      env:
+        BUILD_RESULT: ${{ steps.build.outcome }}
+        HEAP_RESULT: ${{ steps.heap.outcome }}
+        MODULE_RESULT: ${{ steps.module.outcome }}
+        LAUNCH_RESULT: ${{ steps.launch.outcome }}
+        UNLOAD_RESULT: ${{ steps.unload.outcome }}
+        KERNEL_WARNINGS_RESULT: ${{ steps.kernel_warnings.outcome }}
+      run: "for result in \"$BUILD_RESULT\" \"$HEAP_RESULT\" \"$MODULE_RESULT\" \"$LAUNCH_RESULT\" \"$UNLOAD_RESULT\"\
+        \ \"$KERNEL_WARNINGS_RESULT\"; do\n  if [ \"$result\" != success ]; then echo \"Supplemental validation\
+        \ failed: $result\"; exit 1; fi\ndone\n"
+'on':
+  push:
+    branches:
+    - ci/cie-supplemental-ros-validation
+

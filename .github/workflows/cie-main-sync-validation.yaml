@@ -1,4 +1,4 @@
-name: CIE latest main full validation
+name: CIE synced-main full ROS validation
 permissions:
   contents: read
 jobs:
@@ -21,7 +21,7 @@ jobs:
     steps:
     - uses: actions/checkout@v4
       with:
-        ref: dae70aabccc896236eb8a0e693aea69e38890b65
+        ref: 6fddbe5481910d047d8eef8f2be4928c0a9cd97c
         fetch-depth: 1
         persist-credentials: false
     - name: Install ROS and build dependencies
@@ -38,8 +38,8 @@ jobs:
 
         sudo apt-get update
 
-        sudo apt-get install -y --no-install-recommends curl ca-certificates gnupg locales build-essential cmake git pkg-config
-        libgoogle-glog-dev liblttng-ust-dev libunwind-dev libcap2-bin linux-headers-$(uname -r)
+        sudo apt-get install -y --no-install-recommends curl ca-certificates gnupg locales build-essential cmake
+        git pkg-config libgoogle-glog-dev liblttng-ust-dev libunwind-dev libcap2-bin linux-headers-$(uname -r)
 
         sudo locale-gen en_US.UTF-8
 
@@ -61,8 +61,8 @@ jobs:
 
         rosdep install -y --from-paths src --ignore-src --rosdistro ${ROS_DISTRO}
 
-        if ! command -v rustup >/dev/null; then curl --proto ''=https'' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y
-        --profile minimal --default-toolchain 1.75.0; fi
+        if ! command -v rustup >/dev/null; then curl --proto ''=https'' --tlsv1.2 -fsSL https://sh.rustup.rs | sh
+        -s -- -y --profile minimal --default-toolchain 1.75.0; fi
 
         source "$HOME/.cargo/env"
 
@@ -95,8 +95,8 @@ jobs:
 
         source install/setup.bash
 
-        colcon test --packages-select agnocastlib agnocast_cie_thread_configurator --event-handlers console_direct+ --return-code-on-test-failure
-        --ctest-args -LE ''requires_kernel_module|requires_heaphook'' 2>&1 | tee validation-logs/non-module-tests.log
+        colcon test --packages-select agnocastlib agnocast_cie_thread_configurator --event-handlers console_direct+
+        --return-code-on-test-failure --ctest-args -LE ''requires_kernel_module|requires_heaphook'' 2>&1 | tee validation-logs/non-module-tests.log
 
         colcon test-result --verbose 2>&1 | tee validation-logs/non-module-results.log
 
@@ -142,6 +142,63 @@ jobs:
         bash scripts/test/run_requires_kernel_module_tests.bash 2>&1 | tee validation-logs/kernel-tests.log
 
         '
+    - name: Verify delayed client fixture startup and restore exact source
+      id: client_startup
+      if: ${{ !cancelled() && steps.module.outcome == 'success' }}
+      shell: bash
+      run: 'set -eo pipefail
+
+        source /opt/ros/${ROS_DISTRO}/setup.bash
+
+        source install/setup.bash
+
+        client_path=src/agnocastlib/test/integration/test_agnocast_client.cpp
+
+        cp "$client_path" validation-logs/client-fixed.cpp
+
+        trap ''cp validation-logs/client-fixed.cpp "$client_path"'' EXIT
+
+        python3 - <<''PY''
+
+        from pathlib import Path
+
+        p = Path(''src/agnocastlib/test/integration/test_agnocast_client.cpp'')
+
+        s = p.read_text()
+
+        needle = ''    spin_thread_ = std::thread([this]() { executor_->spin(); });''
+
+        assert s.count(needle) == 2
+
+        s = s.replace(needle, ''    spin_thread_ = std::thread([this]() { std::this_thread::sleep_for(250ms); executor_->spin();
+        });'', 1)
+
+        p.write_text(s)
+
+        PY
+
+        cmake --build build/agnocastlib --target test_integration_client_agnocastlib -j4 > validation-logs/client-delayed-build.log
+        2>&1
+
+        timeout --kill-after=2s 30s env LD_PRELOAD="$PWD/install/agnocastlib/lib/libagnocast_heaphook.so" build/agnocastlib/test_integration_client_agnocastlib
+        --gtest_filter=ClientTest.ServiceIsReadyReturnsCorrectValue --gtest_repeat=20 --gtest_break_on_failure 2>&1
+        | tee validation-logs/client-delayed.log
+
+        echo ''GREEN: corrected client fixture passed 20/20 delayed-start lifecycles''
+
+        cp validation-logs/client-fixed.cpp "$client_path"
+
+        cmp validation-logs/client-fixed.cpp "$client_path"
+
+        git diff --exit-code -- "$client_path"
+
+        cmake --build build/agnocastlib --target test_integration_client_agnocastlib -j4 > validation-logs/client-restored-build.log
+        2>&1
+
+        ctest --test-dir build/agnocastlib -R ''^test_integration_client_agnocastlib$'' --output-on-failure 2>&1
+        | tee validation-logs/client-restored.log
+
+        '
     - name: Run CallbackIsolatedExecutor launch and shutdown test
       id: cie
       if: ${{ !cancelled() && steps.module.outcome == 'success' }}
@@ -152,8 +209,9 @@ jobs:
 
         source install/setup.bash
 
-        LD_PRELOAD="$PWD/install/agnocastlib/lib/libagnocast_heaphook.so:$PWD/install/agnocastlib/lib/libagnocast.so" launch_test
-        src/agnocast_e2e_test/test/functional/test_agnocast_callback_isolated_executor_launch.py 2>&1 | tee validation-logs/cie-launch.log
+        LD_PRELOAD="$PWD/install/agnocastlib/lib/libagnocast_heaphook.so:$PWD/install/agnocastlib/lib/libagnocast.so"
+        launch_test src/agnocast_e2e_test/test/functional/test_agnocast_callback_isolated_executor_launch.py 2>&1
+        | tee validation-logs/cie-launch.log
 
         '
     - name: Run all 1-to-1 E2E combinations
@@ -186,21 +244,23 @@ jobs:
       id: unload
       if: ${{ !cancelled() && steps.module.outcome == 'success' }}
       shell: bash
-      run: "set -eo pipefail\nfor attempt in $(seq 10); do\n  if sudo rmmod agnocast; then\n    echo 'PASS: module unloaded\
-        \ after all tests' | tee validation-logs/unload.log\n    exit 0\n  fi\n  sleep 1\ndone\nsudo fuser -v /dev/agnocast\
-        \ || true\nexit 1\n"
+      run: "set -eo pipefail\nfor attempt in $(seq 10); do\n  if sudo rmmod agnocast; then\n    echo 'PASS: module\
+        \ unloaded after all tests' | tee validation-logs/unload.log\n    exit 0\n  fi\n  sleep 1\ndone\nsudo fuser\
+        \ -v /dev/agnocast || true\nexit 1\n"
     - name: Check kernel warnings after module tests
       id: kernel_warnings
       if: ${{ always() && steps.module.outcome == 'success' }}
       shell: bash
-      run: "set -eo pipefail\nsudo dmesg > validation-logs/dmesg.log\nif grep -nE 'BUG:|WARNING:|Oops|Call Trace:' validation-logs/dmesg.log;\
-        \ then\n  echo 'Kernel warnings observed after loading agnocast'\n  exit 1\nfi\n"
+      run: "set -eo pipefail\nsudo dmesg > validation-logs/dmesg.log\nif grep -nE 'BUG:|WARNING:|Oops|Call Trace:'\
+        \ validation-logs/dmesg.log; then\n  echo 'Kernel warnings observed after loading agnocast'\n  exit 1\n\
+        fi\n"
     - name: Collect diagnostics
       if: always()
       shell: bash
       run: "mkdir -p validation-logs\nsudo dmesg > validation-logs/dmesg.log || true\ncp -r /tmp/e2e_1to1_logs validation-logs/\
-        \ 2>/dev/null || true\nif [ -f install/setup.bash ]; then\n  source /opt/ros/${ROS_DISTRO}/setup.bash\n  source install/setup.bash\n\
-        \  colcon test-result --verbose > validation-logs/test-results.log 2>&1 || true\nfi\n"
+        \ 2>/dev/null || true\nif [ -f install/setup.bash ]; then\n  source /opt/ros/${ROS_DISTRO}/setup.bash\n\
+        \  source install/setup.bash\n  colcon test-result --verbose > validation-logs/test-results.log 2>&1 ||\
+        \ true\nfi\n"
     - uses: actions/upload-artifact@v4
       if: always()
       with:
@@ -226,10 +286,13 @@ jobs:
         REFCOUNT_RESULT: ${{ steps.refcount.outcome }}
         UNLOAD_RESULT: ${{ steps.unload.outcome }}
         KERNEL_WARNINGS_RESULT: ${{ steps.kernel_warnings.outcome }}
-      run: "for result in \"$BUILD_RESULT\" \"$UNIT_RESULT\" \"$MODULE_RESULT\" \"$KERNEL_RESULT\" \"$CIE_RESULT\" \"$ONE_RESULT\"\
-        \ \"$TWO_RESULT\" \"$REFCOUNT_RESULT\" \"$UNLOAD_RESULT\" \"$KERNEL_WARNINGS_RESULT\"; do\n  if [ \"$result\" != success\
-        \ ]; then echo \"Validation did not fully pass: $result\"; exit 1; fi\ndone\n"
+        CLIENT_STARTUP_RESULT: ${{ steps.client_startup.outcome }}
+      run: "for result in \"$BUILD_RESULT\" \"$UNIT_RESULT\" \"$MODULE_RESULT\" \"$KERNEL_RESULT\" \"$CIE_RESULT\"\
+        \ \"$ONE_RESULT\" \"$TWO_RESULT\" \"$REFCOUNT_RESULT\" \"$UNLOAD_RESULT\" \"$KERNEL_WARNINGS_RESULT\" \"\
+        $CLIENT_STARTUP_RESULT\"; do\n  if [ \"$result\" != success ]; then echo \"Validation did not fully pass:\
+        \ $result\"; exit 1; fi\ndone\n"
 'on':
   push:
     branches:
     - ci/cie-main-sync-validation
+

@@ -1,0 +1,235 @@
+name: CIE latest main full validation
+permissions:
+  contents: read
+jobs:
+  ros-validation:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - os: ubuntu-24.04
+          ros: jazzy
+        - os: ubuntu-22.04
+          ros: humble
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      ROS_DISTRO: ${{ matrix.ros }}
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
+      MAKEFLAGS: -j4
+      COLCON_DEFAULTS_FILE: ${{ runner.temp }}/cie-colcon-defaults.yaml
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: dae70aabccc896236eb8a0e693aea69e38890b65
+        fetch-depth: 1
+        persist-credentials: false
+    - name: Install ROS and build dependencies
+      shell: bash
+      run: 'set -eo pipefail
+
+        mkdir -p validation-logs
+
+        printf ''build:\n  executor: sequential\n'' > "$COLCON_DEFAULTS_FILE"
+
+        git rev-parse HEAD | tee validation-logs/tested-sha.txt
+
+        uname -a | tee validation-logs/kernel.txt
+
+        sudo apt-get update
+
+        sudo apt-get install -y --no-install-recommends curl ca-certificates gnupg locales build-essential cmake git pkg-config
+        libgoogle-glog-dev liblttng-ust-dev libunwind-dev libcap2-bin linux-headers-$(uname -r)
+
+        sudo locale-gen en_US.UTF-8
+
+        sudo curl -fsSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key -o /usr/share/keyrings/ros-archive-keyring.gpg
+
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu
+        $(. /etc/os-release && echo "$UBUNTU_CODENAME") main" | sudo tee /etc/apt/sources.list.d/ros2.list
+
+        sudo apt-get update
+
+        sudo apt-get install -y --no-install-recommends ros-${ROS_DISTRO}-ros-base python3-rosdep python3-colcon-common-extensions
+        python3-pytest
+
+        source /opt/ros/${ROS_DISTRO}/setup.bash
+
+        if [ ! -f /etc/ros/rosdep/sources.list.d/20-default.list ]; then sudo rosdep init; fi
+
+        rosdep update --rosdistro ${ROS_DISTRO}
+
+        rosdep install -y --from-paths src --ignore-src --rosdistro ${ROS_DISTRO}
+
+        if ! command -v rustup >/dev/null; then curl --proto ''=https'' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y
+        --profile minimal --default-toolchain 1.75.0; fi
+
+        source "$HOME/.cargo/env"
+
+        rustup toolchain install 1.75.0 --profile minimal
+
+        '
+    - name: Build complete workspace and heaphook
+      id: build
+      shell: bash
+      run: 'set -eo pipefail
+
+        source /opt/ros/${ROS_DISTRO}/setup.bash
+
+        source "$HOME/.cargo/env"
+
+        colcon build --symlink-install --executor sequential --cmake-args -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
+        2>&1 | tee validation-logs/build.log
+
+        cargo +1.75.0 build --manifest-path agnocast_heaphook/Cargo.toml --release 2>&1 | tee validation-logs/heaphook.log
+
+        cp agnocast_heaphook/target/release/libagnocast_heaphook.so install/agnocastlib/lib/
+
+        '
+    - name: Run non-module ROS tests
+      id: unit
+      shell: bash
+      run: 'set -eo pipefail
+
+        source /opt/ros/${ROS_DISTRO}/setup.bash
+
+        source install/setup.bash
+
+        colcon test --packages-select agnocastlib agnocast_cie_thread_configurator --event-handlers console_direct+ --return-code-on-test-failure
+        --ctest-args -LE ''requires_kernel_module|requires_heaphook'' 2>&1 | tee validation-logs/non-module-tests.log
+
+        colcon test-result --verbose 2>&1 | tee validation-logs/non-module-results.log
+
+        '
+    - name: Build and load matching kernel module
+      id: module
+      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+      shell: bash
+      run: 'set -eo pipefail
+
+        make -C agnocast_kmod PWD="$PWD/agnocast_kmod" 2>&1 | tee validation-logs/kmod-build.log
+
+        sudo dmesg -C
+
+        sudo insmod agnocast_kmod/agnocast.ko
+
+        grep ''^agnocast '' /proc/modules | tee validation-logs/module-loaded.txt
+
+        test -c /dev/agnocast
+
+        sudo chmod a+rw /dev/agnocast
+
+        '
+    - name: Verify module reference counting
+      id: refcount
+      if: ${{ !cancelled() && steps.module.outcome == 'success' }}
+      shell: bash
+      run: 'set -eo pipefail
+
+        bash scripts/test/test_rmmod_refcount.bash 2>&1 | tee validation-logs/refcount.log
+
+        '
+    - name: Run kernel-module integration tests
+      id: kernel
+      if: ${{ !cancelled() && steps.module.outcome == 'success' }}
+      shell: bash
+      run: 'set -eo pipefail
+
+        source /opt/ros/${ROS_DISTRO}/setup.bash
+
+        source install/setup.bash
+
+        bash scripts/test/run_requires_kernel_module_tests.bash 2>&1 | tee validation-logs/kernel-tests.log
+
+        '
+    - name: Run CallbackIsolatedExecutor launch and shutdown test
+      id: cie
+      if: ${{ !cancelled() && steps.module.outcome == 'success' }}
+      shell: bash
+      run: 'set -eo pipefail
+
+        source /opt/ros/${ROS_DISTRO}/setup.bash
+
+        source install/setup.bash
+
+        LD_PRELOAD="$PWD/install/agnocastlib/lib/libagnocast_heaphook.so:$PWD/install/agnocastlib/lib/libagnocast.so" launch_test
+        src/agnocast_e2e_test/test/functional/test_agnocast_callback_isolated_executor_launch.py 2>&1 | tee validation-logs/cie-launch.log
+
+        '
+    - name: Run all 1-to-1 E2E combinations
+      id: one
+      if: ${{ !cancelled() && steps.module.outcome == 'success' }}
+      shell: bash
+      run: 'set -eo pipefail
+
+        source /opt/ros/${ROS_DISTRO}/setup.bash
+
+        source install/setup.bash
+
+        bash scripts/test/e2e_test_1to1.bash -c -p 2 2>&1 | tee validation-logs/e2e-1to1.log
+
+        '
+    - name: Run all 2-to-2 E2E combinations
+      id: two
+      if: ${{ !cancelled() && steps.module.outcome == 'success' }}
+      shell: bash
+      run: 'set -eo pipefail
+
+        source /opt/ros/${ROS_DISTRO}/setup.bash
+
+        source install/setup.bash
+
+        bash scripts/test/e2e_test_2to2.bash -c 2>&1 | tee validation-logs/e2e-2to2.log
+
+        '
+    - name: Unload module after all tests
+      id: unload
+      if: ${{ !cancelled() && steps.module.outcome == 'success' }}
+      shell: bash
+      run: "set -eo pipefail\nfor attempt in $(seq 10); do\n  if sudo rmmod agnocast; then\n    echo 'PASS: module unloaded\
+        \ after all tests' | tee validation-logs/unload.log\n    exit 0\n  fi\n  sleep 1\ndone\nsudo fuser -v /dev/agnocast\
+        \ || true\nexit 1\n"
+    - name: Check kernel warnings after module tests
+      id: kernel_warnings
+      if: ${{ always() && steps.module.outcome == 'success' }}
+      shell: bash
+      run: "set -eo pipefail\nsudo dmesg > validation-logs/dmesg.log\nif grep -nE 'BUG:|WARNING:|Oops|Call Trace:' validation-logs/dmesg.log;\
+        \ then\n  echo 'Kernel warnings observed after loading agnocast'\n  exit 1\nfi\n"
+    - name: Collect diagnostics
+      if: always()
+      shell: bash
+      run: "mkdir -p validation-logs\nsudo dmesg > validation-logs/dmesg.log || true\ncp -r /tmp/e2e_1to1_logs validation-logs/\
+        \ 2>/dev/null || true\nif [ -f install/setup.bash ]; then\n  source /opt/ros/${ROS_DISTRO}/setup.bash\n  source install/setup.bash\n\
+        \  colcon test-result --verbose > validation-logs/test-results.log 2>&1 || true\nfi\n"
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: cie-main-sync-validation-${{ matrix.ros }}
+        path: 'validation-logs/
+
+          build/*/test_results/
+
+          log/
+
+          '
+        retention-days: 14
+    - name: Require all validation steps to pass
+      if: always()
+      env:
+        BUILD_RESULT: ${{ steps.build.outcome }}
+        UNIT_RESULT: ${{ steps.unit.outcome }}
+        MODULE_RESULT: ${{ steps.module.outcome }}
+        KERNEL_RESULT: ${{ steps.kernel.outcome }}
+        CIE_RESULT: ${{ steps.cie.outcome }}
+        ONE_RESULT: ${{ steps.one.outcome }}
+        TWO_RESULT: ${{ steps.two.outcome }}
+        REFCOUNT_RESULT: ${{ steps.refcount.outcome }}
+        UNLOAD_RESULT: ${{ steps.unload.outcome }}
+        KERNEL_WARNINGS_RESULT: ${{ steps.kernel_warnings.outcome }}
+      run: "for result in \"$BUILD_RESULT\" \"$UNIT_RESULT\" \"$MODULE_RESULT\" \"$KERNEL_RESULT\" \"$CIE_RESULT\" \"$ONE_RESULT\"\
+        \ \"$TWO_RESULT\" \"$REFCOUNT_RESULT\" \"$UNLOAD_RESULT\" \"$KERNEL_WARNINGS_RESULT\"; do\n  if [ \"$result\" != success\
+        \ ]; then echo \"Validation did not fully pass: $result\"; exit 1; fi\ndone\n"
+'on':
+  push:
+    branches:
+    - ci/cie-main-sync-validation

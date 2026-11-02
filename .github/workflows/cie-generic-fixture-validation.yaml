@@ -1,0 +1,252 @@
+name: CIE generic fixture validation
+'on':
+  push:
+    branches:
+    - ci/cie-generic-fixture-validation
+permissions:
+  contents: read
+jobs:
+  fixture-validation:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - os: ubuntu-22.04
+          ros: humble
+        - os: ubuntu-24.04
+          ros: jazzy
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    env:
+      ROS_DISTRO: ${{ matrix.ros }}
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
+      MAKEFLAGS: -j4
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: 4f73a845eb774bd80d017e4f7f7386faa114f2dd
+        fetch-depth: 2
+        persist-credentials: false
+    - name: Install ROS and build dependencies
+      shell: bash
+      run: 'set -eo pipefail
+
+        mkdir -p validation-logs
+
+        git rev-parse HEAD | tee validation-logs/tested-sha.txt
+
+        uname -a | tee validation-logs/kernel.txt
+
+        sudo apt-get update
+
+        sudo apt-get install -y --no-install-recommends curl ca-certificates gnupg locales build-essential cmake git pkg-config
+        libgoogle-glog-dev liblttng-ust-dev libunwind-dev libcap2-bin linux-headers-$(uname -r)
+
+        sudo locale-gen en_US.UTF-8
+
+        sudo curl -fsSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key -o /usr/share/keyrings/ros-archive-keyring.gpg
+
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu
+        $(. /etc/os-release && echo "$UBUNTU_CODENAME") main" | sudo tee /etc/apt/sources.list.d/ros2.list
+
+        sudo apt-get update
+
+        sudo apt-get install -y --no-install-recommends ros-${ROS_DISTRO}-ros-base python3-rosdep python3-colcon-common-extensions
+        python3-pytest
+
+        source /opt/ros/${ROS_DISTRO}/setup.bash
+
+        if [ ! -f /etc/ros/rosdep/sources.list.d/20-default.list ]; then sudo rosdep init; fi
+
+        rosdep update --rosdistro ${ROS_DISTRO}
+
+        rosdep install -y --from-paths src --ignore-src --rosdistro ${ROS_DISTRO}
+
+        if ! command -v rustup >/dev/null; then curl --proto ''=https'' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y
+        --profile minimal --default-toolchain 1.75.0; fi
+
+        source "$HOME/.cargo/env"
+
+        rustup toolchain install 1.75.0 --profile minimal
+
+        '
+    - name: Build complete workspace and heaphook
+      id: build
+      shell: bash
+      run: 'set -eo pipefail
+
+        source /opt/ros/${ROS_DISTRO}/setup.bash
+
+        source "$HOME/.cargo/env"
+
+        colcon build --symlink-install --executor sequential --cmake-args -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
+        2>&1 | tee validation-logs/build.log
+
+        cargo +1.75.0 build --manifest-path agnocast_heaphook/Cargo.toml --release 2>&1 | tee validation-logs/heaphook.log
+
+        cp agnocast_heaphook/target/release/libagnocast_heaphook.so install/agnocastlib/lib/
+
+        '
+    - name: Run non-module ROS tests
+      id: unit
+      shell: bash
+      run: 'set -eo pipefail
+
+        source /opt/ros/${ROS_DISTRO}/setup.bash
+
+        source install/setup.bash
+
+        colcon test --packages-select agnocastlib agnocast_cie_thread_configurator --event-handlers console_direct+ --return-code-on-test-failure
+        --ctest-args -LE ''requires_kernel_module|requires_heaphook'' 2>&1 | tee validation-logs/non-module-tests.log
+
+        colcon test-result --verbose 2>&1 | tee validation-logs/non-module-results.log
+
+        '
+    - name: Build and load matching kernel module
+      id: module
+      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+      shell: bash
+      run: 'set -eo pipefail
+
+        make -C agnocast_kmod PWD="$PWD/agnocast_kmod" 2>&1 | tee validation-logs/kmod-build.log
+
+        sudo insmod agnocast_kmod/agnocast.ko
+
+        grep ''^agnocast '' /proc/modules | tee validation-logs/module-loaded.txt
+
+        test -c /dev/agnocast
+
+        sudo chmod a+rw /dev/agnocast
+
+        '
+    - name: Run kernel-module integration tests
+      id: kernel
+      if: ${{ !cancelled() && steps.module.outcome == 'success' }}
+      shell: bash
+      run: 'set -eo pipefail
+
+        source /opt/ros/${ROS_DISTRO}/setup.bash
+
+        source install/setup.bash
+
+        bash scripts/test/run_requires_kernel_module_tests.bash 2>&1 | tee validation-logs/kernel-tests.log
+
+        '
+    - name: Run CallbackIsolatedExecutor launch and shutdown test
+      id: cie
+      if: ${{ !cancelled() && steps.module.outcome == 'success' }}
+      shell: bash
+      run: 'set -eo pipefail
+
+        source /opt/ros/${ROS_DISTRO}/setup.bash
+
+        source install/setup.bash
+
+        LD_PRELOAD="$PWD/install/agnocastlib/lib/libagnocast_heaphook.so:$PWD/install/agnocastlib/lib/libagnocast.so" launch_test
+        src/agnocast_e2e_test/test/functional/test_agnocast_callback_isolated_executor_launch.py 2>&1 | tee validation-logs/cie-launch.log
+
+        '
+    - name: Prove generic subscription fixture startup race and correction
+      id: fixture_control
+      if: ${{ !cancelled() && steps.module.outcome == 'success' }}
+      shell: bash
+      run: 'set -eo pipefail
+
+        source /opt/ros/${ROS_DISTRO}/setup.bash
+
+        source install/setup.bash
+
+        export ROS_DOMAIN_ID=41
+
+        fixture=src/agnocastlib/test/integration/test_agnocast_generic_subscription.cpp
+
+        binary="$PWD/build/agnocastlib/test_integration_generic_subscription_agnocastlib"
+
+        python - <<''FIXTURE_PY''
+
+        from pathlib import Path
+
+        import subprocess
+
+        path=''src/agnocastlib/test/integration/test_agnocast_generic_subscription.cpp''
+
+        old=subprocess.check_output([''git'',''show'',''HEAD^:''+path],text=True)
+
+        fixed=Path(path).read_text()
+
+        Path(''validation-logs/fixture-exact.cpp'').write_text(fixed)
+
+        needle=''spin_thread_ = std::thread([this]() { executor_->spin(); });''
+
+        replacement=''spin_thread_ = std::thread([this]() { std::this_thread::sleep_for(250ms); executor_->spin(); });''
+
+        assert old.count(needle)==2 and fixed.count(needle)==2
+
+        Path(''validation-logs/fixture-delayed-old.cpp'').write_text(old.replace(needle,replacement,1))
+
+        Path(''validation-logs/fixture-delayed-fixed.cpp'').write_text(fixed.replace(needle,replacement,1))
+
+        Path(path).write_text(Path(''validation-logs/fixture-delayed-old.cpp'').read_text())
+
+        FIXTURE_PY
+
+        colcon build --executor sequential --packages-select agnocastlib --cmake-target test_integration_generic_subscription_agnocastlib
+        2>&1 | tee validation-logs/fixture-red-build.log
+
+        set +e
+
+        LD_PRELOAD="$PWD/install/agnocastlib/lib/libagnocast_heaphook.so" timeout --foreground --kill-after=2 5s "$binary"
+        --gtest_filter=GenericSubscriptionLifecycleTest.get_topic_name_returns_configured_topic > validation-logs/fixture-red.log
+        2>&1
+
+        red_result=$?
+
+        set -e
+
+        if [ "$red_result" -ne 124 ]; then cat validation-logs/fixture-red.log; echo "Expected old fixture timeout, got $red_result";
+        exit 1; fi
+
+        grep -F ''[ RUN      ] GenericSubscriptionLifecycleTest.get_topic_name_returns_configured_topic'' validation-logs/fixture-red.log
+
+        echo ''RED: old fixture requires external timeout when worker startup is delayed''
+
+        cp validation-logs/fixture-delayed-fixed.cpp "$fixture"
+
+        colcon build --executor sequential --packages-select agnocastlib --cmake-target test_integration_generic_subscription_agnocastlib
+        2>&1 | tee validation-logs/fixture-green-build.log
+
+        LD_PRELOAD="$PWD/install/agnocastlib/lib/libagnocast_heaphook.so" timeout --foreground --kill-after=2 30s "$binary"
+        --gtest_filter=GenericSubscriptionLifecycleTest.get_topic_name_returns_configured_topic --gtest_repeat=20 2>&1 | tee
+        validation-logs/fixture-green-repeat.log
+
+        echo ''GREEN: corrected fixture passes 20/20 under the same forced startup delay''
+
+        cp validation-logs/fixture-exact.cpp "$fixture"
+
+        colcon build --executor sequential --packages-select agnocastlib --cmake-target test_integration_generic_subscription_agnocastlib
+        2>&1 | tee validation-logs/fixture-restored-build.log
+
+        LD_PRELOAD="$PWD/install/agnocastlib/lib/libagnocast_heaphook.so" timeout --foreground --kill-after=2 60s "$binary"
+        2>&1 | tee validation-logs/fixture-exact-suite.log
+
+        git diff --exit-code -- "$fixture"
+
+        '
+    - name: Collect diagnostics
+      if: always()
+      shell: bash
+      run: "mkdir -p validation-logs\nsudo dmesg > validation-logs/dmesg.log || true\ncp -r /tmp/e2e_1to1_logs validation-logs/\
+        \ 2>/dev/null || true\nif [ -f install/setup.bash ]; then\n  source /opt/ros/${ROS_DISTRO}/setup.bash\n  source install/setup.bash\n\
+        \  colcon test-result --verbose > validation-logs/test-results.log 2>&1 || true\nfi\n"
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: cie-fixture-validation-${{ matrix.ros }}
+        path: 'validation-logs/
+
+          build/*/test_results/
+
+          log/
+
+          '
+        retention-days: 14

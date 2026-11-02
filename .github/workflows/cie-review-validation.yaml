@@ -22,12 +22,13 @@ jobs:
     timeout-minutes: 90
     env:
       ROS_DISTRO: ${{ matrix.ros }}
-      CMAKE_BUILD_PARALLEL_LEVEL: 2
-      MAKEFLAGS: -j2
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
+      MAKEFLAGS: -j4
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 9f4ec038cb664dc81a866748f29fe53381b213dc
+          ref: ca71b6053689b8eb62d93c3edc1dbea53eb73c67
+          fetch-depth: 2
           persist-credentials: false
       - name: Install ROS and build dependencies
         shell: bash
@@ -62,7 +63,6 @@ jobs:
           cp agnocast_heaphook/target/release/libagnocast_heaphook.so install/agnocastlib/lib/
       - name: Run non-module ROS tests
         id: unit
-        continue-on-error: true
         shell: bash
         run: |
           set -eo pipefail
@@ -81,10 +81,47 @@ jobs:
           grep '^agnocast ' /proc/modules | tee validation-logs/module-loaded.txt
           test -c /dev/agnocast
           sudo chmod a+rw /dev/agnocast
+      - name: Reproduce and verify delayed publisher readiness
+        id: readiness
+        if: ${{ !cancelled() && steps.module.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -eo pipefail
+          source /opt/ros/${ROS_DISTRO}/setup.bash
+          source install/setup.bash
+          export E2E_CONFIG_PATH="$PWD/validation-logs/readiness-config.yaml"
+          export ROS_DOMAIN_ID=40
+          python - <<'CONTROL_PY'
+          from pathlib import Path
+          import subprocess
+          Path('validation-logs/readiness-config.yaml').write_text('use_agnocast_pub: false\nlaunch_pub_before_sub: false\npub_qos_depth: 10\npub_transient_local: true\nsub_qos_depth: 10\nsub_transient_local: false\nuse_take_sub: false\n')
+          path = 'src/agnocast_e2e_test/test/test_1to1.py'
+          old = subprocess.check_output(['git', 'show', 'HEAD^:' + path], text=True)
+          fixed = Path(path).read_text()
+          needle = '    pub_delay, sub_delay, ready_delay = calc_action_delays(config)\n'
+          for name, source in [('original', old), ('fixed', fixed)]:
+              assert source.count(needle) == 1
+              source = source.replace(needle, needle + '    pub_delay += 5.0\n')
+              Path('validation-logs/readiness_' + name + '.py').write_text(source)
+          CONTROL_PY
+          set +e
+          E2E_TOPIC_NAME=/cie_readiness_original launch_test validation-logs/readiness_original.py > validation-logs/readiness-original.log 2>&1
+          original_result=$?
+          set -e
+          if [ "$original_result" -eq 0 ]; then echo 'Expected delayed-start control to fail'; exit 1; fi
+          python - <<'CONTROL_PY'
+          from pathlib import Path
+          s = Path('validation-logs/readiness-original.log').read_text()
+          assert 'FAIL: test_pub' in s and 'AssertionError: 0 != 1' in s, s[-4000:]
+          print('RED: original fixed-time snapshot fails under delayed publisher startup')
+          CONTROL_PY
+          for iteration in 1 2 3; do
+            E2E_TOPIC_NAME=/cie_readiness_fixed_${iteration} launch_test validation-logs/readiness_fixed.py 2>&1 | tee validation-logs/readiness-fixed-${iteration}.log
+          done
+          echo 'GREEN: exact original message assertions pass with bounded completion waits (3/3)'
       - name: Run kernel-module integration tests
         id: kernel
         if: ${{ !cancelled() && steps.module.outcome == 'success' }}
-        continue-on-error: true
         shell: bash
         run: |
           set -eo pipefail
@@ -94,7 +131,6 @@ jobs:
       - name: Run CallbackIsolatedExecutor launch and shutdown test
         id: cie
         if: ${{ !cancelled() && steps.module.outcome == 'success' }}
-        continue-on-error: true
         shell: bash
         run: |
           set -eo pipefail
@@ -104,7 +140,6 @@ jobs:
       - name: Run all 1-to-1 E2E combinations
         id: one
         if: ${{ !cancelled() && steps.module.outcome == 'success' }}
-        continue-on-error: true
         shell: bash
         run: |
           set -eo pipefail
@@ -114,7 +149,6 @@ jobs:
       - name: Run all 2-to-2 E2E combinations
         id: two
         if: ${{ !cancelled() && steps.module.outcome == 'success' }}
-        continue-on-error: true
         shell: bash
         run: |
           set -eo pipefail
@@ -148,11 +182,12 @@ jobs:
           BUILD_RESULT: ${{ steps.build.outcome }}
           UNIT_RESULT: ${{ steps.unit.outcome }}
           MODULE_RESULT: ${{ steps.module.outcome }}
+          READINESS_RESULT: ${{ steps.readiness.outcome }}
           KERNEL_RESULT: ${{ steps.kernel.outcome }}
           CIE_RESULT: ${{ steps.cie.outcome }}
           ONE_RESULT: ${{ steps.one.outcome }}
           TWO_RESULT: ${{ steps.two.outcome }}
         run: |
-          for result in "$BUILD_RESULT" "$UNIT_RESULT" "$MODULE_RESULT" "$KERNEL_RESULT" "$CIE_RESULT" "$ONE_RESULT" "$TWO_RESULT"; do
+          for result in "$BUILD_RESULT" "$UNIT_RESULT" "$MODULE_RESULT" "$READINESS_RESULT" "$KERNEL_RESULT" "$CIE_RESULT" "$ONE_RESULT" "$TWO_RESULT"; do
             if [ "$result" != success ]; then echo "Validation did not fully pass: $result"; exit 1; fi
           done

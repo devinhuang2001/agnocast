@@ -17,7 +17,7 @@ jobs:
       ROS_DISTRO: ${{ matrix.ros }}
       CMAKE_BUILD_PARALLEL_LEVEL: 4
       MAKEFLAGS: -j4
-      COLCON_DEFAULTS_FILE: ${{ runner.temp }}/cie-colcon-defaults.yaml
+      COLCON_DEFAULTS_FILE: /tmp/cie-colcon-defaults.yaml
     steps:
     - uses: actions/checkout@v4
       with:

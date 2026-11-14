@@ -11,10 +11,12 @@
 #include <sys/eventfd.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 using agnocast::CallbackGroupValidator;
@@ -316,6 +318,49 @@ protected:
     return agnocast::id2_timer_info.at(timer_id);
   }
 
+  // Regression for #1697: acquiring a temporary strong owner under
+  // id2_timer_info_mtx makes ~TimerBase() recursively lock the same mutex.
+  template <typename EventHandler>
+  void expect_prepare_survives_concurrent_last_owner_release(
+    uint32_t timer_id, rcl_clock_type_t clock_type)
+  {
+    std::shared_ptr<agnocast::TimerBase> timer;
+    auto info = register_timer(timer_id, clock_type, timer);
+    ASSERT_NE(info, nullptr);
+    std::weak_ptr<agnocast::TimerBase> weak_timer = timer;
+    EventHandler handler(getpid(), &ready_mutex_, &ready_executables_);
+
+    std::atomic<bool> validator_entered{false};
+    std::thread releaser([&] {
+      while (!validator_entered.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      timer.reset();
+    });
+
+    handler.prepare_epoll(epoll_fd_, [&](const rclcpp::CallbackGroup::SharedPtr &) {
+      // The old timer.lock() check holds a second owner across validation.
+      // The fixed timer.expired() check does not.
+      const long owners_before_release = weak_timer.use_count();
+      validator_entered.store(true, std::memory_order_release);
+
+      // The worker's reset reduces the strong count before entering ~TimerBase().
+      // With the fix, the destructor waits for this function to release the mutex.
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      while (
+        weak_timer.use_count() == owners_before_release &&
+        std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+      }
+      EXPECT_LT(weak_timer.use_count(), owners_before_release);
+      return true;
+    });
+
+    // The old code self-deadlocks before this join; the CTest timeout catches it.
+    releaser.join();
+    EXPECT_TRUE(weak_timer.expired());
+  }
+
   std::mutex ready_mutex_;
   std::vector<agnocast::AgnocastExecutable> ready_executables_;
 };
@@ -391,4 +436,16 @@ TEST_F(TimerPrepareEpollTest, a_destroyed_timer_object_is_removed)
 
   // Assert
   EXPECT_FALSE(is_registered(epoll_fd_, info->timer_fd));
+}
+
+TEST_F(TimerPrepareEpollTest, concurrent_last_owner_release_does_not_deadlock_timer_prepare)
+{
+  expect_prepare_survives_concurrent_last_owner_release<agnocast::TimerEventHandler>(
+    14, RCL_STEADY_TIME);
+}
+
+TEST_F(TimerPrepareEpollTest, concurrent_last_owner_release_does_not_deadlock_clock_prepare)
+{
+  expect_prepare_survives_concurrent_last_owner_release<agnocast::ClockEventHandler>(
+    15, RCL_ROS_TIME);
 }
